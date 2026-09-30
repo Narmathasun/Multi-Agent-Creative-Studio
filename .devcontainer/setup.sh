@@ -1,3 +1,5 @@
+cd /workspaces/Multi-Agent-Creative-Studio
+cat > .devcontainer/setup.sh << 'EOF'
 #!/usr/bin/env bash
 set -e
 
@@ -11,4 +13,8 @@ fi
 grep -q "google-cloud-sdk/path.bash.inc" ~/.bashrc || \
   echo 'source "$HOME/google-cloud-sdk/path.bash.inc"' >> ~/.bashrc
 
+echo ">>> Installing git-lfs"
+sudo apt-get update -qq && sudo apt-get install -y -qq git-lfs && git lfs install
+
 echo ">>> Setup complete"
+EOF
