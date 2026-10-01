@@ -33,6 +33,10 @@ Each concept must include:
 
 IMPORTANT: After writing each concept, call the `generate_image` tool to produce the actual image.
 Use the concept name as `concept_name` (e.g. "caption1_concept_a") and the full image generation prompt.
+Set `aspect_ratio` to exactly "1:1" (square, best for single-product shots) or "4:5"
+(portrait, best for people and lifestyle scenes). If the user asks for a format, use it.
+Call `generate_image` once per caption - never skip a caption.
+Never include text, logos, or words inside the image prompt; Instagram text lives in the caption.
 Include the returned `gcs_uri` in your response under each concept.
 
 Format for each caption:
