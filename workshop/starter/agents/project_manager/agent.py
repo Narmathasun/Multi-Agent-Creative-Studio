@@ -3,10 +3,12 @@ import json
 import logging
 import os
 
+from dotenv import load_dotenv
 from google.adk.agents import Agent
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
-from dotenv import load_dotenv
+
 try:
     from .retry import GENERATE_CONTENT_CONFIG
 except ImportError:
@@ -16,43 +18,103 @@ load_dotenv()
 
 logger = logging.getLogger("ai_creative_studio.project_manager")
 
+DESCRIPTION = (
+    "Project manager that turns an approved campaign (captions and visuals) into a "
+    "dated timeline, task list with owners, budget breakdown and milestones. "
+    "Optionally syncs the project and tasks to Notion."
+)
 
+
+# After this many Notion errors in one session the agent is told to stop using Notion.
+MAX_NOTION_ERRORS = 4
+
+
+def _recovery_hint(status: int, code: str, message: str) -> str:
+    """Turn a raw Notion error into an instruction the agent can act on."""
+    lower = message.lower()
+    if status == 404 and code == "object_not_found":
+        # The Notion message blames sharing/permissions, but the usual cause is
+        # passing a database ID as page_id in the parent object.
+        return (
+            "object_not_found: you passed a database ID as page_id. "
+            'Use {"parent": {"database_id": "<id>"}} not {"parent": {"page_id": "<id>"}}. '
+            "If the parent is already database_id, the database is not shared with the "
+            "integration: stop Notion work and report it in Notion Status."
+        )
+    if status == 400 and ("people" in lower or "person" in lower):
+        return "Do not set people/person properties - integration tokens cannot assign users. Retry without them."
+    if status == 400 and "relation" in lower:
+        return "Relation property rejected. Retry creating this page WITHOUT the relation property."
+    if status == 400 and "is not a property that exists" in lower:
+        missing = message.split(" is not a property")[0].strip()
+        return (
+            f"The property '{missing}' does not exist in this database. Retry ONCE with that "
+            "property removed entirely. Do not add it back or guess another name for it."
+        )
+    if status == 400 and "property" in lower:
+        return (
+            "A property value does not match the database schema. Retry ONCE using only the "
+            "properties listed in the schema you already retrieved; drop any you are unsure of."
+        )
+    if status == 401:
+        return "The Notion token is invalid. Stop Notion work and report 'Notion authentication failed' in Notion Status."
+    if status == 403:
+        return "The integration lacks access to this database. Stop Notion work and report it in Notion Status."
+    if status == 429:
+        return "Notion rate limit hit. Retry this call once; if it fails again, skip it and continue."
+    return message or "Unknown Notion error."
+
+
+# Callback: runs after EVERY tool call. Returning None keeps the original result;
+# returning a dict replaces it with what the model sees.
 def handle_notion_error(
     tool: BaseTool,
     args: dict,
     tool_context: ToolContext,
     tool_response: dict,
 ) -> dict | None:
-    """Intercept Notion API errors and replace the raw stack trace with a clean message."""
-    if not tool.name.startswith("API-"):
+    """Intercept Notion API errors and replace the raw error with an actionable recovery hint."""
+    if not tool.name.startswith("API-") or not isinstance(tool_response, dict):
         return None
 
     content = (tool_response.get("content") or [{}])[0].get("text", "")
     try:
         data = json.loads(content)
-    except Exception:
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
         return None
 
     status = data.get("status")
-    if status not in (400, 404):
+    if status not in (400, 401, 403, 404, 429):
         return None
 
-    message = data.get("message", "")
     code = data.get("code", "")
-    logger.warning("Notion %s (%s) on %s — injecting recovery hint", status, code, tool.name)
+    hint = _recovery_hint(status, code, data.get("message", ""))
 
-    if status == 404 and code == "object_not_found":
-        # The misleading Notion message blames sharing/permissions, but the real
-        # cause is passing a database ID as page_id in the parent object.
-        message = (
-            "object_not_found: you passed a database ID as page_id. "
-            'Use {"parent": {"database_id": "<id>"}} not {"parent": {"page_id": "<id>"}}.'
+    # Circuit breaker: count Notion errors in this session so a bad schema can never
+    # trap the agent in an endless retry loop.
+    errors = 1
+    if tool_context is not None:
+        errors = tool_context.state.get("notion_error_count", 0) + 1
+        tool_context.state["notion_error_count"] = errors
+    logger.warning(
+        "Notion %s (%s) on %s - error %d/%d, injecting recovery hint",
+        status, code, tool.name, errors, MAX_NOTION_ERRORS,
+    )
+
+    if errors >= MAX_NOTION_ERRORS:
+        next_step = (
+            f"This is Notion error {errors}. STOP calling Notion tools now. Write the full "
+            "text plan and list in Notion Status what was created and what failed."
         )
+    else:
+        next_step = "Retry with corrected parameters."
 
     return {
         "content": [{
             "type": "text",
-            "text": f"Notion {status} ({code}) on {tool.name}: {message}\n\nRetry with corrected parameters.",
+            "text": f"Notion {status} ({code}) on {tool.name}: {hint}\n\n{next_step}",
         }]
     }
 
@@ -62,6 +124,7 @@ def get_system_instruction(project_database_id=None, tasks_database_id=None):
     # receives no tool instructions for capabilities it doesn't have.
     notion_section = (
         f"""
+## Notion sync (secondary - only after the text plan is complete in your head)
 Projects database ID: {project_database_id}
 Tasks database ID: {tasks_database_id}
 
@@ -84,6 +147,8 @@ Property rules:
 
 If any Notion call fails, continue — the text timeline is always the primary deliverable.
 Write your complete response AFTER all Notion operations are done (or have failed).
+In Notion Status, report exactly what was created (project name and number of tasks)
+and anything that failed.
 
 If image HTTPS links are provided in the input (under "Generated Images" from the Creative
 Director), add them to the Notion project page body as a bulleted list under a
@@ -93,74 +158,119 @@ Director), add them to the Notion project page body as a bulleted list under a
         else ""
     )
 
-    # TODO 1: Write the system instruction for the Project Manager.
-    # It should:
-    #   - Use today's date as the starting point for all timelines
-    #   - Break campaigns into phases: Strategy, Creation, Review, Launch
-    #   - Create tasks with owners and deadlines
-    #   - ALWAYS provide a text timeline first (primary deliverable)
-    #   - Use {notion_section} to optionally include Notion guidance
-    #
-    # Required text output format:
-    #   **Project Timeline:** [phases with dates from today]
-    #   **Task List:** [Task | Owner | Deadline | Status]
-    #   **Budget Breakdown:** [by category]
-    #   **Milestones:** [key checkpoints]
-    #   **Notion Status:** ["Project created..." or "Notion not configured - text timeline only"]
-    #
-    # Today's date: {datetime.date.today().strftime("%B %d, %Y")}
-    return f"""
-# TODO 1: Write the Project Manager system instruction here
+    # Recomputed on every request (see the instruction provider below), so a
+    # long-running Cloud Run container never plans from a stale "today".
+    today = datetime.datetime.now(datetime.UTC).date()
+    notion_default = (
+        "Report what was created in Notion, or what failed."
+        if project_database_id
+        else 'Write exactly: "Notion not configured - text timeline only"'
+    )
 
-Today's date: {datetime.date.today().strftime("%B %d, %Y")}
+    # TODO 1 (done): Project Manager system instruction.
+    return f"""You are an experienced Marketing Project Manager for a digital studio.
+Your job: turn an APPROVED Instagram campaign into an actionable launch plan.
+
+Today's date is {today.strftime("%A, %B %d, %Y")}. Day 1 of the plan is today.
+Every date you write must be a real calendar date on or after today.
+
+## Use the campaign you were given
+The conversation contains the brief, the approved captions and the approved visuals
+(with gcs_uri or https image links). Plan around THOSE exact deliverables:
+- Create one publishing task per approved caption, named by its caption theme.
+- Reference the matching visual concept for each post.
+- If no captions or visuals are present, say so in one line and plan generically.
+Do NOT rewrite captions, invent new visuals, or re-review quality - that work is done.
+
+## Planning rules
+- Four phases in this order: Strategy, Creation, Review, Launch.
+- Default length 14 days unless the brief specifies otherwise.
+- Owners must be roles, not people: Brand Strategist, Copywriter, Designer, Critic,
+  Project Manager, Social Media Manager.
+- Space the Instagram posts at least 2 days apart in the Launch phase.
+- Status for every task starts as "Not Started", except Strategy, copy, visuals and review,
+  which are "Done" because the AI team already completed them.
+- Budget: if the brief gives a budget, split it; otherwise use an illustrative total of
+  $5,000 and label it "illustrative".
+
+## Required output (ALWAYS produce all five sections, in this order)
+
+**Project Timeline:**
+| Phase | Start | End | Key activities |
+
+**Task List:**
+| Task | Owner | Deadline | Status |
+
+**Budget Breakdown:**
+| Category | Amount | Notes |
+
+**Milestones:**
+- [date] - [checkpoint]
+
+**Notion Status:**
+- {notion_default}
+
+The text plan above is the PRIMARY deliverable. Never skip it, even if a tool fails.
 {notion_section}
 """
 
 
 def create_project_manager_agent():
     """Create the Project Manager agent, with Notion MCP if credentials are set."""
-    notion_token           = os.getenv("NOTION_TOKEN")
-    notion_project_db_id   = os.getenv("NOTION_PROJECT_DATABASE_ID")
-    notion_tasks_db_id     = os.getenv("NOTION_TASKS_DATABASE_ID")
+    notion_token = os.getenv("NOTION_TOKEN")
+    notion_project_db_id = os.getenv("NOTION_PROJECT_DATABASE_ID")
+    notion_tasks_db_id = os.getenv("NOTION_TASKS_DATABASE_ID")
 
     if not notion_token or not notion_project_db_id or not notion_tasks_db_id:
         logger.warning("Notion credentials not set — running without Notion integration")
 
-        # TODO 2: Create and return an Agent without tools
-        # Use name="project_manager", model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        # TODO 2 (done): Agent without tools - text plan only.
+        # The instruction is a function (InstructionProvider): fresh date per request,
+        # and ADK does not try to treat the JSON braces in the text as {state} variables.
         return Agent(
             name="project_manager",
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             generate_content_config=GENERATE_CONTENT_CONFIG,
-            # TODO 2: add instruction=get_system_instruction()
-            # TODO 2: add description=
+            instruction=lambda ctx: get_system_instruction(),
+            description=DESCRIPTION,
         )
 
-    else:
-        logger.info(f"Notion configured — projects database: {notion_project_db_id}, tasks database: {notion_tasks_db_id}")
+    logger.info(
+        "Notion configured — projects database: %s, tasks database: %s",
+        notion_project_db_id, notion_tasks_db_id,
+    )
 
-        # TODO 3: Create the MCP toolset for Notion
-        # Hint: import McpToolset, StdioConnectionParams from google.adk.tools.mcp_tool
-        #       import StdioServerParameters from mcp
-        #
-        # server_params = StdioServerParameters(
-        #     command="notion-mcp-server",
-        #     env={"NOTION_TOKEN": notion_token, "PATH": os.environ.get("PATH", "")}
-        # )
-        # notion_toolset = McpToolset(
-        #     connection_params=StdioConnectionParams(server_params=server_params, timeout=30.0)
-        # )
+    # TODO 3 (done): Create the MCP toolset for Notion.
+    # Imported here so the no-Notion branch never needs the MCP packages.
+    from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams
+    from mcp import StdioServerParameters
 
-        # TODO 3: Create and return an Agent WITH the notion_toolset
-        return Agent(
-            name="project_manager",
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            generate_content_config=GENERATE_CONTENT_CONFIG,
-            after_tool_callback=handle_notion_error,
-            # TODO 3: add instruction=get_system_instruction(project_database_id=notion_project_db_id, tasks_database_id=notion_tasks_db_id)
-            # TODO 3: add description=
-            # TODO 3: add tools=[notion_toolset]
+    # ADK launches the Notion MCP server as a child process and talks to it over
+    # stdin/stdout. The token is passed only to that process's environment.
+    server_params = StdioServerParameters(
+        command="notion-mcp-server",
+        env={"NOTION_TOKEN": notion_token, "PATH": os.environ.get("PATH", "")},
+    )
+    notion_toolset = McpToolset(
+        connection_params=StdioConnectionParams(server_params=server_params, timeout=30.0)
+    )
+
+    # TODO 3 (done): Agent WITH the Notion toolset and the error-recovery callback.
+    def instruction(ctx: ReadonlyContext) -> str:
+        return get_system_instruction(
+            project_database_id=notion_project_db_id,
+            tasks_database_id=notion_tasks_db_id,
         )
+
+    return Agent(
+        name="project_manager",
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        generate_content_config=GENERATE_CONTENT_CONFIG,
+        after_tool_callback=handle_notion_error,
+        instruction=instruction,
+        description=DESCRIPTION,
+        tools=[notion_toolset],
+    )
 
 
 root_agent = create_project_manager_agent()
