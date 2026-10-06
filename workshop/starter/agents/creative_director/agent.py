@@ -42,23 +42,38 @@ def create_creative_director():
         FunctionTool(func=get_image_links),
     ]
 
-    # TODO 2: For each specialist URL that is set, create a RemoteA2aAgent
-    # and wrap it in an AgentTool, then append to agent_tools.
-    #
-    # Pattern for each specialist:
-    #
-    # if strategist_url:
-    #     available_agents_list.append(
-    #         "- **brand_strategist**: Researches market trends, competitors, and audience insights"
-    #     )
-    #     strategist_agent = RemoteA2aAgent(
-    #         name="brand_strategist",
-    #         description="Brand strategist for market research and competitive insights",
-    #         agent_card=f"{strategist_url}/.well-known/agent.json",
-    #     )
-    #     agent_tools.append(AgentTool(agent=strategist_agent))
-    #
-    # Repeat for: copywriter_url, designer_url, critic_url, pm_url
+    # TODO 2 (done): Wrap every configured specialist as a REMOTE tool.
+    # RemoteA2aAgent only knows the specialist's address: it downloads the agent card
+    # (name, skills, endpoint) and sends requests over the network. No specialist
+    # code is imported here - each one runs as its own Cloud Run service.
+    specialists = [
+        ("brand_strategist", strategist_url,
+         "Researches audience insights, 2-3 competitors and 3-5 trends. Research only."),
+        ("copywriter", copywriter_url,
+         ("Writes exactly 3 Instagram captions in different tones, using the research. "
+          "Also revises captions when given Critic feedback.")),
+        ("designer", designer_url,
+         ("Generates one real image per caption, stores it in Cloud Storage and returns "
+          "gcs_uri links. Also regenerates images when given Critic feedback.")),
+        ("critic", critic_url,
+         ("Reviews captions and the real images; returns POSTS / VISUALS / OVERALL with "
+          "APPROVED or NEEDS_REVISION.")),
+        ("project_manager", pm_url,
+         ("Builds the dated timeline, task list, budget and milestones for an APPROVED "
+          "campaign; optionally syncs to Notion.")),
+    ]
+    for name, url, description in specialists:
+        if not url:
+            logger.warning("%s URL not set - specialist unavailable", name)
+            continue
+        available_agents_list.append(f"- **{name}**: {description}")
+        remote_agent = RemoteA2aAgent(
+            name=name,
+            description=description,
+            agent_card=f"{url.rstrip('/')}/.well-known/agent.json",
+        )
+        agent_tools.append(AgentTool(agent=remote_agent))
+        logger.info("Registered remote specialist %s at %s", name, url)
 
     available_agents_text = (
         "\n".join(available_agents_list)
@@ -89,31 +104,27 @@ def create_creative_director():
         generate_content_config=generation_config,
     )
 
-    # TODO 3: Wrap the agent in an App with EventsCompactionConfig
-    # This prevents token limit failures in long 5-agent workflows.
-    #
-    # Hint:
-    # from google.adk.apps import App
-    # from google.adk.apps.app import EventsCompactionConfig
-    # from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
-    # from google.adk.models import Gemini
-    #
-    # compaction_config = EventsCompactionConfig(
-    #     summarizer=LlmEventSummarizer(llm=Gemini(model_id="gemini-2.5-flash")),
-    #     compaction_interval=3,
-    #     overlap_size=1,
-    # )
-    # app = App(
-    #     name="creative_director",
-    #     root_agent=agent,
-    #     events_compaction_config=compaction_config,
-    #     plugins=[LoggingPlugin()],
-    # )
-    # return agent, app
-
-    # Placeholder return until App is configured
+    # TODO 3 (done): Wrap the agent in an App with events compaction.
+    # A full run moves a lot of text between 5 specialists (research, captions,
+    # reviews, revisions). Every 3 turns, older events are summarised by an LLM so
+    # the conversation never exceeds the model's context window.
     from google.adk.apps import App
-    app = App(name="creative_director", root_agent=agent, plugins=[LoggingPlugin()])
+    from google.adk.apps.app import EventsCompactionConfig
+    from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
+    from google.adk.models import Gemini
+
+    summarizer_model = os.getenv("COMPACTION_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    compaction_config = EventsCompactionConfig(
+        summarizer=LlmEventSummarizer(llm=Gemini(model=summarizer_model)),
+        compaction_interval=3,
+        overlap_size=1,
+    )
+    app = App(
+        name="creative_director",
+        root_agent=agent,
+        events_compaction_config=compaction_config,
+        plugins=[LoggingPlugin()],
+    )
     return agent, app
 
 

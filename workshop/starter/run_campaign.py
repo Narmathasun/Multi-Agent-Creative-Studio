@@ -1,9 +1,12 @@
 """
 Run a campaign through the deployed Creative Director on Agent Engine.
-Usage: uv run run_campaign.py
+Usage:
+    uv run run_campaign.py                       # built-in EcoFlow brief
+    uv run run_campaign.py "One-line brief ..."  # your own brief
 """
 
 import os
+import sys
 
 import vertexai
 from dotenv import load_dotenv
@@ -26,7 +29,7 @@ agent_engine = client.agent_engines.get(name=resource_name)
 session = agent_engine.create_session(user_id="workshop-user")
 print(f"Session: {session['id']}\n")
 
-campaign_brief = """
+DEFAULT_BRIEF = """
 Create a complete Instagram campaign for:
 - Product: EcoFlow Smart Water Bottle (tracks hydration, keeps drinks cold 24h)
 - Target Audience: Health-conscious millennials, 25-35 years old
@@ -36,6 +39,10 @@ Create a complete Instagram campaign for:
 - Budget: $3,000
 - Timeline: Launch in 2 weeks
 """
+
+# A brief passed on the command line overrides the default.
+campaign_brief = " ".join(sys.argv[1:]).strip() or DEFAULT_BRIEF
+print(f"Brief: {campaign_brief.strip()}\n")
 
 for event in agent_engine.stream_query(
     user_id="workshop-user",
