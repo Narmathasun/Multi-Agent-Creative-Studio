@@ -38,7 +38,8 @@ def call_callback(tool_name, response):
 def test_no_notion_branch_has_no_tools(monkeypatch):
     agent = build(monkeypatch, notion=False)
     assert agent.tools == []
-    text = agent.instruction(None)
+    text = agent.instruction
+    assert isinstance(text, str)  # A2A agent cards need a plain-text instruction
     assert "Notion not configured - text timeline only" in text
     assert "API-" not in text  # no tool guidance for tools it doesn't have
 
@@ -47,7 +48,7 @@ def test_notion_branch_has_mcp_toolset_and_callback(monkeypatch):
     agent = build(monkeypatch, notion=True)
     assert type(agent.tools[0]).__name__ == "McpToolset"
     assert agent.after_tool_callback is pm.handle_notion_error
-    text = agent.instruction(None)
+    text = agent.instruction
     assert "test-notion_project_database_id" in text
     assert '{"relation": [{"id": "<project-page-id>"}]}' in text  # braces rendered correctly
 
@@ -66,9 +67,11 @@ def test_instruction_has_all_sections_and_today():
     for section in ["**Project Timeline:**", "**Task List:**", "**Budget Breakdown:**",
                     "**Milestones:**", "**Notion Status:**"]:
         assert section in text
-    today = datetime.datetime.now(datetime.UTC).date()
-    assert today.strftime("%B %d, %Y") in text
     assert "Strategy, Creation, Review, Launch" in text
+    captured = []
+    pm.add_current_date(None, SimpleNamespace(append_instructions=captured.extend))
+    today = datetime.datetime.now(datetime.UTC).date()
+    assert today.strftime("%B %d, %Y") in captured[0]
 
 
 # --- Error recovery callback -------------------------------------------------

@@ -5,7 +5,8 @@ import os
 
 from dotenv import load_dotenv
 from google.adk.agents import Agent
-from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 
@@ -158,9 +159,6 @@ Director), add them to the Notion project page body as a bulleted list under a
         else ""
     )
 
-    # Recomputed on every request (see the instruction provider below), so a
-    # long-running Cloud Run container never plans from a stale "today".
-    today = datetime.datetime.now(datetime.UTC).date()
     notion_default = (
         "Report what was created in Notion, or what failed."
         if project_database_id
@@ -171,7 +169,7 @@ Director), add them to the Notion project page body as a bulleted list under a
     return f"""You are an experienced Marketing Project Manager for a digital studio.
 Your job: turn an APPROVED Instagram campaign into an actionable launch plan.
 
-Today's date is {today.strftime("%A, %B %d, %Y")}. Day 1 of the plan is today.
+Today's date is given at the end of these instructions. Day 1 of the plan is today.
 Every date you write must be a real calendar date on or after today.
 
 ## Use the campaign you were given
@@ -215,6 +213,16 @@ The text plan above is the PRIMARY deliverable. Never skip it, even if a tool fa
 """
 
 
+def add_current_date(callback_context: CallbackContext, llm_request: LlmRequest):
+    """Runs before every model call: appends today's date to the instructions.
+
+    The instruction itself stays plain text because ADK builds the A2A agent
+    card from it, and the card builder only accepts a string.
+    """
+    today = datetime.datetime.now(datetime.UTC).date()
+    llm_request.append_instructions([f"Today's date is {today.strftime('%A, %B %d, %Y')}."])
+
+
 def create_project_manager_agent():
     """Create the Project Manager agent, with Notion MCP if credentials are set."""
     notion_token = os.getenv("NOTION_TOKEN")
@@ -225,13 +233,12 @@ def create_project_manager_agent():
         logger.warning("Notion credentials not set — running without Notion integration")
 
         # TODO 2 (done): Agent without tools - text plan only.
-        # The instruction is a function (InstructionProvider): fresh date per request,
-        # and ADK does not try to treat the JSON braces in the text as {state} variables.
         return Agent(
             name="project_manager",
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             generate_content_config=GENERATE_CONTENT_CONFIG,
-            instruction=lambda ctx: get_system_instruction(),
+            instruction=get_system_instruction(),
+            before_model_callback=add_current_date,
             description=DESCRIPTION,
         )
 
@@ -256,18 +263,16 @@ def create_project_manager_agent():
     )
 
     # TODO 3 (done): Agent WITH the Notion toolset and the error-recovery callback.
-    def instruction(ctx: ReadonlyContext) -> str:
-        return get_system_instruction(
-            project_database_id=notion_project_db_id,
-            tasks_database_id=notion_tasks_db_id,
-        )
-
     return Agent(
         name="project_manager",
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         generate_content_config=GENERATE_CONTENT_CONFIG,
+        before_model_callback=add_current_date,
         after_tool_callback=handle_notion_error,
-        instruction=instruction,
+        instruction=get_system_instruction(
+            project_database_id=notion_project_db_id,
+            tasks_database_id=notion_tasks_db_id,
+        ),
         description=DESCRIPTION,
         tools=[notion_toolset],
     )

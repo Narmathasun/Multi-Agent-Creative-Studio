@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "agents"))
 
-from brand_strategist.agent import get_system_instruction
+from brand_strategist.agent import SYSTEM_INSTRUCTION, current_date_note
 from brand_strategist.agent import root_agent as strategist
 from copywriter.agent import root_agent as copywriter
 
@@ -16,8 +16,8 @@ def test_strategist_uses_google_search():
     assert [t.name for t in strategist.tools] == ["google_search"]
 
 
-def test_strategist_instruction_has_sections_year_and_limits():
-    text = get_system_instruction(None)
+def test_strategist_instruction_has_sections_and_limits():
+    text = SYSTEM_INSTRUCTION
     for section in [
         "**Audience Insights:**",
         "**Competitive Analysis:**",
@@ -25,7 +25,8 @@ def test_strategist_instruction_has_sections_year_and_limits():
         "**Key Strategic Insights:**",
     ]:
         assert section in text
-    assert str(datetime.datetime.now(datetime.UTC).year) in text
+    assert str(datetime.datetime.now(datetime.UTC).year) in current_date_note()
+    assert strategist.before_model_callback is not None
     assert "RESEARCH ONLY" in text
     assert "Do NOT write Instagram captions" in text
 

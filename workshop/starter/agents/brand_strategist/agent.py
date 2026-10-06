@@ -4,7 +4,8 @@ import os
 
 from dotenv import load_dotenv
 from google.adk.agents import Agent
-from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest
 from google.adk.tools.google_search_tool import google_search
 
 try:
@@ -18,21 +19,19 @@ logger = logging.getLogger("ai_creative_studio.brand_strategist")
 
 
 # TODO 1 (done): System instruction.
-# Built by a function (an ADK "InstructionProvider") instead of a fixed string,
-# so today's date is recalculated on every request. A fixed f-string would freeze
-# the date at the moment a long-running Cloud Run container started.
-def get_system_instruction(context: ReadonlyContext) -> str:
-    today = datetime.datetime.now(datetime.UTC).date()
-    return f"""You are a senior Brand Strategist at a digital marketing studio.
+# Kept as plain text: ADK builds the A2A agent card from it, and the card
+# builder only accepts a string. Today's date is added per request by the
+# add_current_date callback below, so it never goes stale on Cloud Run.
+SYSTEM_INSTRUCTION = """You are a senior Brand Strategist at a digital marketing studio.
 Your ONLY job is research. You gather the raw insights that a separate
 copywriter and designer will use later.
 
-Today's date is {today.strftime("%B %d, %Y")}. The current year is {today.year}.
+Today's date and the current year are given at the end of these instructions.
 
 ## How to research
-Use the google_search tool. ALWAYS include the current year ({today.year}) in
-every search query so results are fresh, for example:
-"<product category> target audience trends {today.year}".
+Use the google_search tool. ALWAYS include the current year in every search
+query so results are fresh, for example:
+"<product category> target audience trends <current year>".
 Run several focused searches covering:
 1. The target audience: needs, pain points, values, and Instagram behaviour.
 2. Two to three competitor brands in the same category: their positioning,
@@ -68,12 +67,26 @@ Respond with exactly these four labelled sections, in this order:
 """
 
 
+def current_date_note() -> str:
+    today = datetime.datetime.now(datetime.UTC).date()
+    return (
+        f"Today's date is {today.strftime('%B %d, %Y')}. "
+        f"The current year is {today.year}: include {today.year} in every search query."
+    )
+
+
+def add_current_date(callback_context: CallbackContext, llm_request: LlmRequest):
+    """Runs before every model call: appends today's date to the instructions."""
+    llm_request.append_instructions([current_date_note()])
+
+
 # TODO 2 (done): Create the root_agent.
 root_agent = Agent(
     name="brand_strategist",
     model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     generate_content_config=GENERATE_CONTENT_CONFIG,
-    instruction=get_system_instruction,
+    instruction=SYSTEM_INSTRUCTION,
+    before_model_callback=add_current_date,
     description=(
         "Research-only brand strategist. Uses web search to return audience "
         "insights, competitive analysis, trending topics, and key strategic "
