@@ -3,14 +3,20 @@ Run a campaign through the deployed Creative Director on Agent Engine.
 Usage:
     uv run run_campaign.py                       # built-in EcoFlow brief
     uv run run_campaign.py "One-line brief ..."  # your own brief
+
+Prints the run live and saves a self-contained HTML report in reports/.
 """
 
+import datetime
 import os
+import pathlib
 import sys
 
 import vertexai
 from dotenv import load_dotenv
 from vertexai import Client
+
+from campaign_report import CampaignRun, build_html, load_images
 
 load_dotenv()
 
@@ -44,12 +50,22 @@ Create a complete Instagram campaign for:
 campaign_brief = " ".join(sys.argv[1:]).strip() or DEFAULT_BRIEF
 print(f"Brief: {campaign_brief.strip()}\n")
 
+run = CampaignRun()
 for event in agent_engine.stream_query(
     user_id="workshop-user",
     session_id=session["id"],
     message=campaign_brief,
 ):
-    if "content" in event and "parts" in event["content"]:
-        for part in event["content"]["parts"]:
-            if "text" in part:
-                print(part["text"], end="", flush=True)
+    update = run.add_event(event)
+    if update["step"]:
+        print(f"\n[→ calling {update['step']}]", flush=True)
+    if update["text"]:
+        print(update["text"], end="", flush=True)
+
+# Save the finished campaign as one HTML file with the images embedded.
+images = load_images(run.image_uris, project=PROJECT_ID)
+reports_dir = pathlib.Path(__file__).parent / "reports"
+reports_dir.mkdir(exist_ok=True)
+report_path = reports_dir / f"campaign-{datetime.datetime.now():%Y%m%d-%H%M%S}.html"
+report_path.write_text(build_html(campaign_brief, run, images), encoding="utf-8")
+print(f"\n\n📄 Report saved: {report_path}  ({len(images)} images, {run.revision_rounds} revision round(s))")

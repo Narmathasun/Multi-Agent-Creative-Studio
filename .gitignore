@@ -116,3 +116,8 @@ Desktop.ini
 *.bak
 *.swp
 .cache/
+
+# Generated campaign reports and Streamlit secrets
+workshop/starter/reports/
+.streamlit/secrets.toml
+streamlit_app/.streamlit/secrets.toml
